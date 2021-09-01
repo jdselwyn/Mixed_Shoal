@@ -827,3 +827,95 @@ ggplot(df.venn) +
         plot.background = element_blank())
 
 
+#### Further Microsatellite Analysis ####
+library(poppr)
+library(pegas)
+library(hierfstat)
+
+just_certain_id <- full_cope_data %>%
+  select(ID, starts_with('COPE'), starts_with('CPER'), morph_species, co1_species, microsat_species, 
+         structure_assignment_prob, joint_species) %>%
+  filter(co1_species != 'unknown',
+         # structure_assignment_prob > 0.9,
+         !is.na(joint_species)) %>%
+  dplyr::select(ID, joint_species, COPE5:CPER188) %$%
+  df2genind(.[,c(-1:-2)], sep='/', ind.names=ID, pop=joint_species, NA.char =NA, type='codom') 
+
+#### Basic Summary
+seppop(just_certain_id) %>%
+  map(summary)
+
+summary_stats <- basic.stats(just_certain_id, diploid = TRUE)
+
+just_certain_id %>%
+  seppop() %>%
+  map(hw.test, B = 10000) %>%
+  map(~as_tibble(.) %>%
+        mutate(p_adj = p.adjust(Pr.exact, 'holm'))) %>%
+  bind_rows(.id = 'species') %>%
+  mutate(sig = p_adj < 0.05) %T>%
+  print %>%
+  filter(sig)
+
+
+private_alleles(just_certain_id, count.alleles = FALSE, report = 'data.frame') %>%
+  as_tibble() %>%
+  separate(allele, into = c('locus', 'allele')) %>%
+  group_by(population, locus) %>%
+  summarise(count = sum(count), .groups = 'drop') %>%
+  pivot_wider(names_from = 'population',
+              values_from = 'count')
+
+
+
+#### Inbreeding
+summary_stats$Fis
+
+tukey.nonadditivity.test <- function(the.aov) {
+  the.model <- the.aov$model
+  y <- the.model[,1]; f1 <- the.model[,2]; f2 <- the.model[,3]
+  lm.1 <- lm(y~f1+f2)
+  interact.term <- fitted(lm.1)^2
+  lm.2 <- lm(y~f1+f2+interact.term)
+  return(anova(lm.2)[3,])
+}
+
+library(broom)
+library(emmeans)
+
+fis_aov <- summary_stats$Fis %>%
+  as_tibble(rownames = 'locus') %>%
+  pivot_longer(cols = -locus,
+               names_to = 'species',
+               values_to = 'fis') %>%
+  aov(fis ~ species + locus, data = .) 
+
+tukey.nonadditivity.test(fis_aov)
+diag.plots(fis_aov)
+car::Anova(fis_aov, type = 2)
+effectsize(car::Anova(fis_aov, type = 2), partial = TRUE)
+
+emmeans(fis_aov, ~locus) %>% multcomp::cld(Letters = LETTERS) %>%
+  as_tibble %>%
+  mutate(.group = str_trim(.group),
+         locus = fct_reorder(locus, emmean)) %>%
+  ggplot(aes(x = locus, y = emmean, ymin = emmean - SE, ymax = emmean + SE)) +
+  geom_pointrange() +
+  geom_text(aes(y = 1.05 * (emmean + SE), label = .group))
+
+
+#### Population Differentiation
+fstat(just_certain_id, fstonly = TRUE)
+gstat.randtest(just_certain_id, nsim = 9999)
+
+
+just_certain_id %>%
+  as.loci() %>%
+  Fst
+
+locus_specific_p <- just_certain_id %>%
+  seploc() %>%
+  map(gstat.randtest, nsim = 9999) %>%
+  map_dbl(~.x$pvalue)
+
+p.adjust(locus_specific_p, 'holm')
