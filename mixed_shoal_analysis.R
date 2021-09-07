@@ -831,6 +831,8 @@ ggplot(df.venn) +
 library(poppr)
 library(pegas)
 library(hierfstat)
+library(ggrepel)
+library(patchwork)
 
 just_certain_id <- full_cope_data %>%
   select(ID, starts_with('COPE'), starts_with('CPER'), morph_species, co1_species, microsat_species, 
@@ -882,6 +884,7 @@ tukey.nonadditivity.test <- function(the.aov) {
 
 library(broom)
 library(emmeans)
+library(effectsize)
 
 fis_aov <- summary_stats$Fis %>%
   as_tibble(rownames = 'locus') %>%
@@ -919,3 +922,606 @@ locus_specific_p <- just_certain_id %>%
   map_dbl(~.x$pvalue)
 
 p.adjust(locus_specific_p, 'holm')
+
+#### PCA ####
+all_fish_msat <- full_cope_data %>%
+  select(ID, starts_with('COPE'), starts_with('CPER'), morph_species, co1_species, microsat_species, 
+         structure_assignment_prob, joint_species) %>%
+  dplyr::select(ID, joint_species, COPE5:CPER188) %$%
+  df2genind(.[,c(-1:-2)], sep='/', ind.names=ID, pop=joint_species, NA.char =NA, type='codom') %>%
+  tab(NA.method="asis") %>%
+  as_tibble(rownames = 'ID')
+
+
+all_fish_mtdna <- full_cope_data %>%
+  select(ID, sequence) %>%
+  mutate(sequence = as.integer(as.factor(sequence)) %>% str_c('mt', .)) %>%
+  na.omit %>%
+  mutate(present = 1L) %>%
+  pivot_wider(names_from = sequence, 
+              values_from = present,
+              values_fill = 0L)
+
+
+all_fish_pores <- full_cope_data %>%
+  select(ID, number_of_pores) %>%
+  mutate(number_of_pores = str_c('pores_', number_of_pores)) %>%
+  na.omit %>%
+  mutate(present = 1L) %>%
+  pivot_wider(names_from = number_of_pores, 
+              values_from = present,
+              values_fill = 0L)
+
+
+missing_mean <- full_join(all_fish_pores,
+                          all_fish_mtdna,
+                          by = 'ID') %>%
+  full_join(all_fish_msat,
+            by = 'ID') %>%
+  arrange(ID) %>%
+  mutate(across(where(is.integer), ~replace_na(., mean(., na.rm = TRUE))))
+
+joint_pca <- dudi.pca(missing_mean[,-1], scannf=FALSE, center = TRUE, scale=TRUE, nf = ncol(missing_mean) - 1)
+
+
+veganCovEllipse<-function (x, se = TRUE, conf = 0.95, npoints = 100) 
+{
+  #X is a dataframe of 2 coordinates
+  
+  covariance_mat <- cov.wt(x, wt=rep(1/nrow(x), nrow(x)))
+  
+  cov <- covariance_mat$cov
+  
+  if(se){cov <- cov * sum(covariance_mat$wt^2)}
+  
+  center <- covariance_mat$center
+  
+  scale <- sqrt(qchisq(conf, 2))
+  
+  theta <- (0:npoints) * 2 * pi/npoints
+  Circle <- cbind(cos(theta), sin(theta))
+  t(center + scale * t(Circle %*% chol(cov))) %>% as_tibble()
+}
+
+percent_explained <- joint_pca$eig / sum(joint_pca$eig) * 100
+
+scree_plot <- tibble(component = 1:length(percent_explained),
+                     pct_exp = percent_explained) %>%
+  mutate(cumpct = cumsum(pct_exp)) %>%
+  ggplot(aes(x = component, y = pct_exp)) +
+  geom_col() +
+  geom_point(size = 3) +
+  scale_y_continuous(labels = scales::percent_format(scale = 1, accuracy = 0.1), expand = expansion(mult = c(0, 0.1), add = 0)) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0), add = c(1, 0))) +
+  labs(y = 'Variance Explained (%)',
+       x = 'Principle Component') +
+  theme_classic() +
+  theme(axis.text = element_text(colour = 'black'),
+        plot.background = element_rect(fill = 'transparent', colour = NA),
+        panel.background = element_rect(fill = 'transparent', colour = NA))
+
+pca_results <- joint_pca$li %>%
+  as_tibble() %>%
+  bind_cols(missing_mean[,1]) %>%
+  left_join(full_cope_data, by = 'ID') %>%
+  mutate(reason = case_when(co1_species != microsat_species & co1_species != 'unknown' ~ 'Mitochondrial - Nuclear Disagreement',
+                            morph_species != microsat_species & morph_species != 'unknown' ~ 'Morphological - Molecular Disagreement',
+                            structure_assignment_prob < 0.9 ~ 'Low Assignment Probability',
+                            TRUE ~ joint_species)) %>%
+  filter(!is.na(reason)) 
+
+
+species_elipse <- pca_results %>%
+  filter(reason %in% c('chya', 'cpers')) %>%
+  select(reason, Axis1, Axis2) %>%
+  nest(data = -c(reason)) %>%
+  mutate(path = map(data, veganCovEllipse, se = FALSE)) %>%
+  select(-data) %>%
+  unnest(path)
+
+
+pca_plot <- pca_results %>%
+  mutate(ID = str_remove(ID, 'COPE-')) %>%
+  ggplot(aes(x = Axis1, y = Axis2, colour = reason)) +
+  geom_hline(yintercept = 0, linetype = 'dashed') +
+  geom_vline(xintercept = 0, linetype = 'dashed') +
+  geom_path(data = filter(species_elipse, reason == 'cpers'), colour = '#3f3f3fff', size = 1.5) +
+  geom_path(data = filter(species_elipse, reason == 'chya'), colour = '#9f9f9fff', size = 1.5) +
+  geom_point(data = . %>% filter(reason == 'cpers'), colour = '#3f3f3fff', size = 1.5) +
+  geom_point(data = . %>% filter(reason == 'chya'), colour = '#9f9f9fff', size = 1.5) +
+  geom_point(data = . %>% filter(!reason %in% c('chya', 'cpers')), size = 3) +
+  geom_label_repel(data = . %>% filter(!reason %in% c('chya', 'cpers')), aes(label = ID), 
+                   fill = alpha(c("white"), 1), show.legend = FALSE) +
+  
+  
+  scale_colour_brewer(palette = "Set1") +
+  labs(x = str_c('PC1 (', round(percent_explained, 2)[1], '%)'),
+       y = str_c('PC2 (', round(percent_explained, 2)[2], '%)'),
+       colour = NULL) +
+  theme_classic() +
+  theme(legend.position = 'top',
+        legend.text = element_text(colour = 'black', size = 12),
+        axis.text = element_text(colour = 'black', size = 10),
+        axis.title = element_text(colour = 'black', size = 12))
+
+layout <- c(
+  area(t = 1, l = 1, b = 100, r = 100),
+  area(t = 69, r = 32, b = 99, l = 2)
+)
+plot(layout)
+
+pca_plot + scree_plot + 
+  plot_layout(design = layout)
+ggsave('PCA plot.svg', height = 15, width = 15)
+
+library(tidytext)
+joint_pca$c1 %>% 
+  as_tibble(rownames = 'param') %>%
+  select(param, str_c('CS', 1:5)) %>%
+  pivot_longer(cols = -param) %>%
+  mutate(abs_value = abs(value)) %>%
+  group_by(name) %>%
+  arrange(-abs_value) %>%
+  top_n(10) %>%
+  ungroup %>%
+  mutate(name = str_replace(name, 'CS', 'PC')) %>%
+  nest(data = -name) %>%
+  arrange(name) %>%
+  mutate(name = str_c(name, ' (', round(percent_explained, 2)[1:5], '%)')) %>%
+  unnest(data) %>%
+  mutate(param = reorder_within(param, abs_value, name)) %>%
+  ggplot(aes(x = abs_value, y = param, fill = value > 0)) +
+  geom_col() +
+  scale_y_reordered() +
+  scale_fill_discrete(labels = c('Negative', 'Positive')) +
+  facet_wrap(~name, scales = 'free_y') +
+  labs(x = "|Variable Weighting|",
+       y = NULL,
+       fill = NULL) +
+  theme_classic() +
+  theme(axis.text = element_text(colour = 'black'),
+        legend.position = c(5/6, 1/4))
+ggsave('var_weights.png', height = 10, width = 10)
+
+
+the_manova <- pca_results %>%
+  select(Axis1, Axis2, reason) %>%
+  filter(!reason %in% c('cpers', 'chya')) %>%
+  manova(cbind(Axis1, Axis2) ~ reason, data = .)
+
+car::Anova(the_manova) 
+
+emmeans(the_manova, ~reason) %>% pairs
+
+effectsize(anova(the_manova))
+
+#### New Hybrids ####
+#### Write newhybrids data file
+resample_data <- function(data, direction){
+  data %>%
+    nest(data = -c(z_option)) %>%
+    rowwise %>%
+    mutate(n = nrow(data)) %>%
+    ungroup() %>%
+    mutate(upsample = n[z_option == 'z0'],
+           downsample = n[z_option == 'z1']) %>%
+    rowwise %>%
+    mutate(data = if_else(z_option == if_else(direction == 'upsample', 'z1', 'z0'), 
+                          list(sample_n(data, replace = TRUE, size = !!sym(direction))),
+                          list(data))) %>%
+    select(z_option, data) %>%
+    unnest(data) %>%
+    mutate(id = 1:n())
+}
+
+make_newhybrid_data <- function(data, path, z_option = FALSE, resample_option = 'nosample'){
+  if(resample_option != 'nosample'){
+    #must be either NULL, upsample, or downsample
+    data <- resample_data(data, resample_option)
+  }
+  
+  if(z_option){
+    data <- mutate(data, id = str_c(id, '\t', z_option))
+  }
+  
+  out <- data %>%
+    select(-z_option) %>%
+    select(ID, id, everything())
+  
+  write_csv(out, str_c(path, 'newhybrid_data.csv', sep = '/'))
+  out_file <- str_c(path, 'cope.dat', sep = '/')
+  
+  tibble(setting = c('NumIndivs', 'NumLoci', 'Digits', 'Format'), value = c(nrow(out), '7', '3', 'Lumped')) %>%
+    write_delim(out_file, delim = ' ', col_names = FALSE)
+  write_lines("", out_file, append = TRUE)
+  write_lines(str_c(c('LocusNames', colnames(select(data, starts_with('COPE'), starts_with('CPER')))), collapse = ' '),
+              out_file, append = TRUE)
+  write_lines("", out_file, append = TRUE)
+  write_delim(select(out, -ID), out_file, delim = ' ', col_names = FALSE, append = TRUE)
+  
+}
+
+newhybrid_data <- full_cope_data %>%
+  select(ID, starts_with('COPE'), starts_with('CPER'), morph_species, co1_species, microsat_species, 
+         structure_assignment_prob, joint_species) %>%
+  filter(!is.na(microsat_species)) %>%
+  
+  #Additional to use z option
+  mutate(possible_hybrid = (structure_assignment_prob < 0.9 | 
+                              (microsat_species != morph_species & morph_species != 'unknown') | 
+                              (microsat_species != co1_species & co1_species != 'unknown'))) %>%
+  filter(possible_hybrid | !is.na(joint_species)) %>%
+  mutate(z_option = case_when(possible_hybrid ~ '',
+                              !possible_hybrid & joint_species == 'chya' ~ 'z0',
+                              !possible_hybrid & joint_species == 'cpers' ~ 'z1')) %>%
+  
+  select(ID, z_option, starts_with('COPE'), starts_with('CPER')) %>%
+  mutate(across(COPE5:CPER188, ~str_remove(., '/')),
+         across(COPE5:CPER188, ~str_replace(., 'NANA', '0'))) %>%
+  mutate(id = 1:n()) 
+
+
+#### Write new hybrdis frequency files
+#Normal 1 generation
+write_lines("3", "freqOneGeneration.dat", append = FALSE)
+tibble(type = c('pure_a', 'pure_b', 'f1'), 
+       a = c(1, 0, 0), 
+       b = c(0, 0, 0.5), 
+       c = c(0, 0, 0.5), 
+       d = c(0, 1, 0)) %>%
+  write_delim("freqOneGeneration.dat", delim = ' ', col_names = FALSE, append = TRUE)
+
+#Normal 2 generation
+write_lines("6", "freqTwoGeneration.dat", append = FALSE)
+tibble(type = c('pure_a', 'pure_b', 'f1', 'f2', 'a_bx', 'b_bx'), 
+       a = c(1, 0, 0, 0.25, 0.5, 0), 
+       b = c(0, 0, 0.5, 0.25, 0.25, 0.25), 
+       c = c(0, 0, 0.5, 0.25, 0.25, 0.25), 
+       d = c(0, 1, 0, 0.25, 0, 0.5)) %>%
+  write_delim("freqTwoGeneration.dat", delim = ' ', col_names = FALSE, append = TRUE)
+
+#2 Generations but no F2 hybrids
+write_lines("5", "freqSpecialGeneration.dat", append = FALSE)
+tibble(type = c('pure_a', 'pure_b', 'f1', 'a_bx', 'b_bx'), 
+       a = c(1, 0, 0, 0.5, 0), 
+       b = c(0, 0, 0.5, 0.25, 0.25), 
+       c = c(0, 0, 0.5, 0.25, 0.25), 
+       d = c(0, 1, 0, 0, 0.5)) %>%
+  write_delim("freqSpecialGeneration.dat", delim = ' ', col_names = FALSE, append = TRUE)
+
+
+
+#### Run 2 generation script ####
+burnin <- 100000
+iterations <- 1000000
+chains <- 5
+gens_to_sim <- c('One', 'Special', 'Two')
+
+gens_to_sim <- c('Two')
+cores <- 5
+base_dir <- getwd()
+z <- 0
+
+
+for(Z_OPT in c(TRUE, FALSE)){
+  for(RESAMP_OPT in c('upsample', 'downsample')){ #nosample run before 
+    for(jefferies in c(TRUE, FALSE)){
+      for(gen in gens_to_sim){
+        for(i in 1:chains){
+          z_option <- if_else(Z_OPT, 'with_z', 'no_z')
+          
+          message('Start ', 'z-option: ', z_option, ', resampling: ', RESAMP_OPT, ', prior: ', c('Jefferies, ', 'Uniform, ')[as.integer(!jefferies) + 1], 'gen: ', gen, ', chain: ', i, ', ', Sys.time())
+          z <- z + 1
+          
+          working_dir <- paste0('./', z_option, '/', RESAMP_OPT, '/', c('Jefferies', 'Uniform')[as.integer(!jefferies) + 1], '/', gen, ' Generation/Run', i)
+          
+          dir.create(working_dir, recursive = TRUE)
+          
+          make_newhybrid_data(newhybrid_data, path = working_dir, z_option = Z_OPT, resample_option = RESAMP_OPT)
+          
+          file.copy(from = "NewHybrids_PC_1_1_WOG.exe",
+                    to   = paste0(working_dir, '/', "NewHybrids_PC_1_1_WOG.exe"))
+          file.copy(from = paste0('freq', gen, 'Generation.dat'),
+                    to   = paste0(working_dir, '/', paste0('freq', gen, 'Generation.dat')))
+          
+          setwd(working_dir)
+          
+          out <- system2("NewHybrids_PC_1_1_WOG.exe",
+                         input = c("cope.dat",
+                                   paste0('freq', gen, 'Generation.dat'),
+                                   "0", #no priors for allele freq
+                                   sample(1:20, 2), #rng
+                                   as.integer(!jefferies), #jefferies priors
+                                   as.integer(!jefferies), #jefferies priors
+                                   format(burnin, scientific = FALSE),
+                                   format(iterations, scientific = FALSE),
+                                   'X'),
+                         stdout = 'terminal.out',
+                         wait = (z %% cores == 0))
+          
+          setwd(base_dir)
+          if((z %% cores == 0)){message('Finished ', 'z-option: ', z_option, ', resampling: ', RESAMP_OPT, ', prior: ', c('Jefferies, ', 'Uniform, ')[as.integer(!jefferies) + 1], 'gen: ', gen, ', chain: ', i, ', ', Sys.time())}
+        }
+      }
+    }
+  }
+}
+
+
+#### Read in Fitted NewHybrids
+library(tidyverse)
+library(magrittr)
+library(posterior)
+
+get_headers <- function(number){
+  if(number == 'One'){
+    c('id', 'pure_a', 'pure_b', 'F1')
+  } else if(number == 'Two') {
+    c('id', 'pure_a', 'pure_b', 'F1', 'F2', 'a_bx', 'b_bx')
+  } else if(number == 'Special') {
+    c('id', 'pure_a', 'pure_b', 'F1', 'a_bx', 'b_bx')
+  } 
+}
+
+read_trace <- function(file, generations){
+  out_file <- read_lines(file)
+  
+  out_file[str_which(out_file, 'Currently on Sweep')]
+  
+  out_file[str_which(out_file, 'Currently on Sweep') + 5]
+  
+  tibble(sweep = out_file[str_which(out_file, 'Currently on Sweep')],
+         pi_values = out_file[str_which(out_file, 'Currently on Sweep') + 5]) %>%
+    mutate(sweep = str_extract(sweep, '[0-9]+') %>% parse_integer,
+           pi_values = str_trim(pi_values)) %>%
+    separate(pi_values, sep = '[ ]+', into = get_headers(generations)[-1]) %>%
+    mutate(across(where(is.character), as.numeric))
+}
+
+read_PoZ <- function(file, generations){
+  read_delim(file, delim = '\t', 
+             col_types = cols(.default = col_double()),
+             skip = 1,
+             col_names = get_headers(generations)) 
+}
+
+species_colours <- c('CPERS_BX' = 'red', 'CHYA_BX' = 'green', 'F1' = 'blue', 'CPERS' = 'gray10', 'CHYA' = 'gray70', F2 = 'purple')
+
+
+## Trace Plots 
+traces <- list.files(recursive = TRUE, pattern = "terminal.out", full.names = TRUE) %>%
+  tibble(file = .) %>%
+  mutate(sampling = str_extract(file, 'downsample|upsample|nosample') %>% str_remove('sample'),
+         generations = str_extract(file, 'One|Special|Two'),
+         .chain = str_extract(file, 'Run[0-9]+') %>% str_remove('Run') %>% as.integer,
+         z_setting = str_extract(file, 'no_z|with_z'),
+         prior = str_extract(file, 'Uniform|Jefferies')) %>%
+  filter(sampling == 'no') %>%
+  rowwise(generations, .chain, z_setting, prior, sampling) %>%
+  summarise(read_trace(file, generations), .groups = 'keep') %>%
+  mutate(.iteration = 1:n(),
+         max_iter = max(.iteration)) %>%
+  ungroup %>%
+  filter(.iteration <= min(max_iter)) %>%
+  select(-max_iter) %>%
+  
+  #Fix label switching
+  nest(data = -c(generations, .chain, z_setting, prior, sampling)) %>%
+  rowwise %>%
+  mutate(original_a_bigger = all(data$pure_a > data$pure_b)) %>%
+  mutate(data = case_when(!original_a_bigger & generations != 'One' ~ list(rename(data, 
+                                                                                  tmp = pure_a,
+                                                                                  tmp2 = a_bx) %>%
+                                                                             rename(pure_a = pure_b,
+                                                                                    a_bx = b_bx,
+                                                                                    pure_b = tmp,
+                                                                                    b_bx = tmp2)),
+                          !original_a_bigger & generations == 'One' ~ list(rename(data, 
+                                                                                  tmp = pure_a) %>%
+                                                                             rename(pure_a = pure_b,
+                                                                                    pure_b = tmp)), 
+                          TRUE ~ list(data))) %>%
+  unnest(data)
+
+
+traces %>%
+  filter(generations == 'Two') %>%
+  filter(z_setting == 'no_z') %>%
+  filter(prior == 'Uniform') %>%
+  pivot_longer(cols = c(pure_a, pure_b, F1, F2, a_bx, b_bx)) %>%
+  filter(!is.na(value)) %>%
+  ggplot(aes(x = sweep, y = value, colour = as.character(.chain))) +
+  geom_line() +
+  facet_grid(name ~ ., scales = 'free_y') +
+  labs(x = 'iteration',
+       y = 'Proportion of Population',
+       colour = 'Chain') +
+  theme_classic()
+ggsave('newhybrids_trace.png')
+
+
+rhats <- traces %>%
+  select(-sweep, -original_a_bigger) %>%
+  nest(data = -c(generations, z_setting, prior, sampling)) %>%
+  rowwise(generations, z_setting, prior, sampling) %>%
+  mutate(data = list(select(data, where(~!all(is.na(.x))))),
+         data = list(as_draws(data))) %>%
+  summarise(summarise_draws(data),
+            .groups = 'drop')
+
+rhats %>%
+  filter(generations == 'Two') %>%
+  filter(z_setting == 'no_z') %>%
+  filter(prior == 'Uniform') %>%
+  filter(sampling == 'no') 
+
+#### New Hybrids Results
+hybridization_chains <- list.files(recursive = TRUE, pattern = "aa-PofZ.txt", full.names = TRUE) %>%
+  str_subset('Million', negate = TRUE) %>%
+  tibble(file = .) %>%
+  mutate(dataFile = str_replace(file, 'aa-PofZ.txt', 'newhybrid_data.csv'),
+         sampling = str_extract(file, 'downsample|upsample|nosample') %>% str_remove('sample'),
+         generations = str_extract(file, 'One|Special|Two'),
+         .chain = str_extract(file, 'Run[0-9]+') %>% str_remove('Run') %>% as.integer,
+         z_setting = str_extract(file, 'no_z|with_z'),
+         prior = str_extract(file, 'Uniform|Jefferies')) %>%
+  filter(sampling == 'no') %>%
+  rowwise(generations, .chain, z_setting, prior, sampling) %>%
+  mutate(data = list(read_csv(dataFile, col_types = cols(.default = col_double(), 
+                                                         ID = col_character(), id = col_character())) %>%
+                       mutate(id = row_number() - 1L)),
+         results = list(read_PoZ(file, generations))) %>%
+  summarise(full_join(data, results, by = 'id'),
+            .groups = 'drop') %>%
+  select(-starts_with('COPE'), -starts_with('CPER'), -id) %>%
+  
+  #Make sure label flip didnt happen & fix if it did
+  nest(data = -c(generations, .chain, z_setting, prior, sampling)) %>%
+  left_join(select(traces, generations, .chain, z_setting, prior, sampling, original_a_bigger) %>%
+              distinct,
+            by = c('generations', '.chain', 'z_setting', 'prior', 'sampling')) %>%
+  rowwise %>%
+  mutate(data = case_when(!original_a_bigger & generations != 'One' ~ list(rename(data, 
+                                                                                  tmp = pure_a,
+                                                                                  tmp2 = a_bx) %>%
+                                                                             rename(pure_a = pure_b,
+                                                                                    a_bx = b_bx,
+                                                                                    pure_b = tmp,
+                                                                                    b_bx = tmp2)),
+                          !original_a_bigger & generations == 'One' ~ list(rename(data, 
+                                                                                  tmp = pure_a) %>%
+                                                                             rename(pure_a = pure_b,
+                                                                                    pure_b = tmp)), 
+                          TRUE ~ list(data))) %>%
+  select(-original_a_bigger) %>%
+  unnest(data) %>%
+  
+  #Join to original data
+  left_join(full_cope_data, by = 'ID') %>%
+  select(ID, generations:sampling, starts_with('pure'), F1, F2, ends_with('bx'), 
+         morph_species, co1_species, microsat_species, structure_assignment_prob) %>%
+  mutate(possible_hybrid = (structure_assignment_prob < 0.9 | 
+                              (microsat_species != morph_species & morph_species != 'unknown') | 
+                              (microsat_species != co1_species & co1_species != 'unknown'))) %>%
+  # filter(possible_hybrid) %>%
+  identity()
+
+
+hybridization_chains %>%
+  # group_by(ID, id, generations, .chain, z_setting, prior, sampling) %>%
+  # sample_n(1) %>% #take only 1 from the upsamples 
+  # ungroup %>%
+  
+  pivot_longer(cols = c(starts_with('pure'), F1, F2, ends_with('bx'))) %>%
+  filter(!is.na(value)) %>%
+  mutate(name = case_when(name == 'pure_a' ~ 'CHYA',
+                          name == 'pure_b' ~ 'CPERS',
+                          name == 'a_bx' ~ 'CHYA_BX',
+                          name == 'b_bx' ~ 'CPERS_BX',
+                          TRUE ~ name),
+         name = factor(name, levels = rev(c('CPERS', 'CHYA', 'CPERS_BX', 'CHYA_BX', 'F1', 'F2')))) %>%
+  mutate(id = as.integer(as.factor(ID))) %>%
+  
+  ggplot(aes(x = id, y = value, fill = name)) +
+  geom_col() +
+  scale_fill_manual(values = species_colours) +
+  facet_grid(.chain ~ generations + z_setting + prior + sampling)
+
+
+
+hybridization_spread <- hybridization_chains %>%
+  # filter(.chain == 1) %>%
+  pivot_longer(cols = c(starts_with('pure'), F1, F2, ends_with('bx'))) %>%
+  filter(!is.na(value)) %>%
+  mutate(name = case_when(name == 'pure_a' ~ 'CHYA',
+                          name == 'pure_b' ~ 'CPERS',
+                          name == 'a_bx' ~ 'CHYA_BX',
+                          name == 'b_bx' ~ 'CPERS_BX',
+                          TRUE ~ name),
+         name = factor(name, levels = rev(c('CPERS', 'CHYA', 'CPERS_BX', 'CHYA_BX', 'F1', 'F2')))) %>%
+  
+  
+  mutate(id = as.integer(as.factor(ID))) %>%
+  
+  group_by(generations, z_setting, prior, sampling, id, ID, name) %>%
+  summarise(assigment_prob = mean(value),
+            max_diff = max(dist(value)),
+            sd_value = sd(value),
+            .groups = 'drop_last') %>%
+  mutate(assigment_prob = assigment_prob / sum(assigment_prob),
+         cv_value = sd_value / assigment_prob) %>%
+  ungroup 
+
+
+hybridization_spread %>%
+  filter(generations != 'One') %>%
+  filter(assigment_prob != 0) %>%
+  ggplot(aes(x = generations, y = cv_value, colour = name)) +
+  stat_summary(position = position_dodge(0.2))
+
+
+hybridization_results <- hybridization_spread %>%
+  select(-max_diff:-cv_value) %>%
+  filter(generations == 'Two') %>%
+  filter(z_setting == 'no_z') %>%
+  filter(prior == 'Uniform') %>%
+  
+  left_join(full_cope_data, by = 'ID') %>%
+  select(generations, z_setting, prior, sampling, id, ID, name, assigment_prob, shoal, ends_with('species'), structure_assignment_prob) %>%
+  mutate(reason = case_when(co1_species != microsat_species & co1_species != 'unknown' ~ 'DNA disagreement',
+                            morph_species != microsat_species & morph_species != 'unknown' ~ 'morph disagreement',
+                            structure_assignment_prob < 0.9 ~ 'low structure prob',
+                            TRUE ~ joint_species)) %>%
+  select(-shoal:-structure_assignment_prob) 
+
+hybrid_table_results <- hybridization_results %>%
+  select(-generations:-id) %>%
+  mutate(name = if_else(name %in% c('F1', 'F2', 'CHYA_BX', 'CPERS_BX'), 
+                        'First or Second Generation Hybrid', as.character(name))) %>%
+  group_by(ID, name, reason) %>%
+  summarise(assigment_prob = sum(assigment_prob), .groups = 'drop') %>%
+  pivot_wider(names_from = name, values_from = assigment_prob) %>%
+  filter(!reason %in% c('cpers', 'chya')) %>%
+  mutate(reason = factor(reason, 
+                         levels = c('morph disagreement', 'DNA disagreement', 'low structure prob'))) %>%
+  arrange(reason, ID)
+
+hybrid_table_results %>%
+  mutate(across(where(is.numeric), ~round(., 3))) %>%
+  write_csv('newHybrids_res.csv')
+
+
+hybridization_results %>%
+  filter(!reason %in% c('chya', 'cpers')) %>%
+  mutate(ID = str_remove(ID, 'COPE-')) %>%
+  
+  #merge across non-pure categories
+  mutate(name = as.character(name),
+         name = if_else(name %in% c('CHYA', 'CPERS'), name, 'First or Second Generation Hybrid'),
+         name = factor(name, levels = rev(c('CPERS', 'CHYA', 'First or Second Generation Hybrid')))) %>%
+  
+  mutate(reason = case_when(reason == 'DNA disagreement' ~ 'Mitochondrial - Nuclear Disagreement',
+                            reason == 'morph disagreement' ~ 'Morphological - Molecular Disagreement',
+                            TRUE ~ 'Low Assignment Probability'),
+         reason = factor(reason, 
+                         levels = c('Morphological - Molecular Disagreement',
+                                    'Mitochondrial - Nuclear Disagreement',
+                                    'Low Assignment Probability'))) %>%
+  group_by(generations, z_setting, prior, id, ID, reason, name) %>%
+  summarise(assigment_prob = sum(assigment_prob), .groups = 'drop') %>%
+  
+  ggplot(aes(x = ID, y = assigment_prob, fill = name)) +
+  geom_col() +
+  scale_fill_manual(values = c(species_colours, 'First or Second Generation Hybrid' = 'red')) +
+  facet_grid(generations ~ reason, scales = 'free_x', space = 'free_x') +
+  labs(x = NULL,
+       y = 'Assignment Posterior Probability',
+       fill = NULL) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme_classic()  +
+  theme(axis.text = element_text(colour = 'black'),
+        legend.position = 'bottom')
+ggsave('newHybrids_results.png')
+
+
+
