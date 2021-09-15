@@ -1523,5 +1523,34 @@ hybridization_results %>%
         legend.position = 'bottom')
 ggsave('newHybrids_results.png')
 
+#### Length Differences ####
+library(broom)
+full_cope_data %>%
+  select(ID, sl_mm, contains('species')) %>%
+  pivot_longer(cols = contains('species')) %>%
+  na.omit() %>%
+  filter(value != 'unknown') %>%
+  group_by(name) %>%
+  summarise(n = n(),
+            n_cpers = sum(value == 'cpers'),
+            n_chya = sum(value == 'chya'),
+            tidy(t.test(sl_mm ~ value)))
 
+disagreement_anova <- full_cope_data %>%
+  select(ID, sl_mm, contains('species'), structure_assignment_prob) %>%
+  mutate(reason = case_when(co1_species != microsat_species & co1_species != 'unknown' ~ 'DNA disagreement',
+                            morph_species != microsat_species & morph_species != 'unknown' ~ 'morph disagreement',
+                            structure_assignment_prob < 0.9 ~ 'low structure prob',
+                            TRUE ~ joint_species)) %>%
+  aov(sl_mm ~ reason, data = .)
+
+anova(disagreement_anova)
+effectsize(disagreement_anova)
+
+emmeans(disagreement_anova, ~reason) %>% contrast('pairwise')
+
+emmeans(disagreement_anova, ~reason) %>%
+  tidy %>%
+  ggplot(aes(x = reason, y = estimate, ymin = estimate - std.error, ymax = estimate + std.error)) +
+  geom_pointrange()
 
