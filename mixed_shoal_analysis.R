@@ -844,8 +844,17 @@ just_certain_id <- full_cope_data %>%
   df2genind(.[,c(-1:-2)], sep='/', ind.names=ID, pop=joint_species, NA.char =NA, type='codom') 
 
 #### Basic Summary
-seppop(just_certain_id) %>%
-  map(summary)
+AR <- seppop(just_certain_id) %>%
+  map(summary) %T>%
+  print %>%
+  map(~.x$loc.n.all) %>%
+  map(~tibble(locus = names(.), AR = .)) %>%
+  bind_rows(.id = 'species')
+
+rareified_AR <- genind2hierfstat(just_certain_id, pop = NULL) %>% 
+  allelic.richness() %$%
+  set_colnames(Ar, c('cpers', 'chya')) %T>%
+  print
 
 summary_stats <- basic.stats(just_certain_id, diploid = TRUE)
 
@@ -905,6 +914,68 @@ emmeans(fis_aov, ~locus) %>% multcomp::cld(Letters = LETTERS) %>%
   ggplot(aes(x = locus, y = emmean, ymin = emmean - SE, ymax = emmean + SE)) +
   geom_pointrange() +
   geom_text(aes(y = 1.05 * (emmean + SE), label = .group))
+
+
+#### Locus x Species ANOVAs
+all_anova <- full_join(as_tibble(summary_stats$Hs, rownames = 'locus') %>%
+                         pivot_longer(cols = -locus, names_to = 'species', values_to = 'Hs'), 
+                       as_tibble(summary_stats$Fis, rownames = 'locus') %>%
+                         pivot_longer(cols = -locus, names_to = 'species', values_to = 'Fis'),
+                       by = c('species', 'locus')) %>%
+  full_join(AR,
+            by = c('species', 'locus')) %>%
+  full_join(as_tibble(rareified_AR, rownames = 'locus') %>%
+              pivot_longer(cols = -locus, names_to = 'species', values_to = 'rarified_AR'),
+            by = c('species', 'locus')) %>%
+  mutate(across(c(species, locus), factor)) %>%
+  pivot_longer(cols = -c(locus, species)) %>%
+  nest(data = -c(name)) %>%
+  rowwise(name, data) %>%
+  summarise(anova = list(aov(value ~ locus + species, data = data)),
+            .groups = 'rowwise')  %>%
+  mutate(locus = tidy(anova) %>% filter(term == 'locus') %>% select(-term),
+         species = tidy(anova) %>% filter(term == 'species') %>% select(-term),
+         interaction = tukey.nonadditivity.test(anova) %>% tidy %>% select(-term)) %>%
+  
+  mutate(locus_means = list(emmeans(anova, ~locus) %>% tidy),
+         species_means = list(emmeans(anova, ~species) %>% tidy),
+         anova(anova) %>% effectsize() %>% as_tibble %>% select(Parameter, Eta2_partial) %>% 
+           pivot_wider(names_from = 'Parameter', values_from = 'Eta2_partial') %>% rename_with(~str_c(., '_es')))
+
+all_anova %>%
+  ungroup %>%
+  select(name, anova) %>%
+  rowwise(name) %>%
+  summarise(fitted = resid(anova),
+            residual = resid(anova),
+            .groups = 'drop') %>%
+  ggplot(aes(sample = residual)) +
+  stat_qq_line() +
+  stat_qq() +
+  facet_wrap(~name, scales = 'free')
+
+
+all_anova %>%
+  ungroup %>%
+  select(name, anova) %>%
+  rowwise(name) %>%
+  summarise(fitted = resid(anova),
+            residual = resid(anova),
+            .groups = 'keep') %>%
+  summarise(tidy(shapiro.test(residual)))
+
+
+all_anova %>%
+  ungroup %>%
+  select(name, locus, locus_es, species, species_es, interaction)
+
+
+all_anova %>%
+  ungroup %>%
+  filter(interaction$p.value > 0.05) %>%
+  filter(locus$p.value < 0.05 | species$p.value < 0.05) %>%
+  select(locus_means) %>%
+  unnest(locus_means)
 
 
 #### Population Differentiation
@@ -1191,7 +1262,7 @@ tibble(type = c('pure_a', 'pure_b', 'f1', 'a_bx', 'b_bx'),
 
 
 
-#### Run 2 generation script ####
+#### Run 2 generation script 
 burnin <- 100000
 iterations <- 1000000
 chains <- 5
@@ -1525,6 +1596,7 @@ ggsave('newHybrids_results.png')
 
 #### Length Differences ####
 library(broom)
+
 full_cope_data %>%
   select(ID, sl_mm, contains('species')) %>%
   pivot_longer(cols = contains('species')) %>%
@@ -1536,11 +1608,13 @@ full_cope_data %>%
             n_chya = sum(value == 'chya'),
             tidy(t.test(sl_mm ~ value)))
 
+
+
 disagreement_anova <- full_cope_data %>%
   select(ID, sl_mm, contains('species'), structure_assignment_prob) %>%
-  mutate(reason = case_when(co1_species != microsat_species & co1_species != 'unknown' ~ 'DNA disagreement',
-                            morph_species != microsat_species & morph_species != 'unknown' ~ 'morph disagreement',
-                            structure_assignment_prob < 0.9 ~ 'low structure prob',
+  mutate(reason = case_when(co1_species != microsat_species & co1_species != 'unknown' ~ 'Mitochondrial - Nuclear Disagreement',
+                            structure_assignment_prob < 0.9 ~ 'Low Assignment Probability',
+                            (morph_species != microsat_species | morph_species != co1_species & co1_species != 'unknown') & morph_species != 'unknown' ~ 'Morphological - Molecular Disagreement',
                             TRUE ~ joint_species)) %>%
   aov(sl_mm ~ reason, data = .)
 
