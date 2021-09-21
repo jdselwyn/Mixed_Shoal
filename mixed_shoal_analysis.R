@@ -1598,33 +1598,61 @@ ggsave('newHybrids_results.png')
 library(broom)
 
 full_cope_data %>%
+  filter(!is.na(sl_mm)) %>%
+  select(ID, sl_mm, morph_species) %>%
+  mutate(wasID = morph_species != 'unknown') %>%
+  summarise(n = n(),
+            IDd = sum(wasID),
+            notID = sum(!wasID),
+            tidy(t.test(sl_mm ~ wasID)))
+
+
+morph_id_type_data <- full_cope_data %>%
+  mutate(reason = case_when(co1_species != microsat_species & co1_species != 'unknown' ~ 'Mitochondrial - Nuclear Disagreement',
+                            structure_assignment_prob < 0.9 ~ 'Low Assignment Probability',
+                            (morph_species != microsat_species | morph_species != co1_species & co1_species != 'unknown') & morph_species != 'unknown' ~ 'Morphological - Molecular Disagreement',
+                            TRUE ~ joint_species)) %>%
+  filter(!is.na(sl_mm)) %>%
+  select(ID, sl_mm, morph_species, reason) %>%
+  filter(!is.na(reason)) %>%
+  mutate(wasID = morph_species != 'unknown',
+         id_type = case_when(morph_species == 'unknown' ~ 'no id',
+                             !reason %in% c('cpers', 'chya') ~ 'mis id',
+                             TRUE ~ 'correct'))
+
+kruskal.test(sl_mm ~ wasID, data = morph_id_type_data)
+morph_id_type_data %>%
+  summarise(n = n(),
+            id_length = median(sl_mm[wasID]),
+            noID_length = median(sl_mm[!wasID]),
+            n_id = sum(wasID),
+            n_noID = sum(!wasID),
+            tidy(kruskal.test(sl_mm ~ wasID)))
+
+
+kruskal.test(sl_mm ~ id_type, data = filter(morph_id_type_data, id_type != 'no id'))
+morph_id_type_data %>%
+  filter(id_type != 'no id') %>%
+  summarise(n = n(),
+            correct_length = median(sl_mm[id_type == 'correct']),
+            misID_length = median(sl_mm[id_type != 'correct']),
+            n_id = sum(id_type == 'correct'),
+            n_misID = sum(id_type != 'correct'),
+            tidy(kruskal.test(sl_mm ~ id_type)))
+
+
+full_cope_data %>%
   select(ID, sl_mm, contains('species')) %>%
   pivot_longer(cols = contains('species')) %>%
   na.omit() %>%
   filter(value != 'unknown') %>%
   group_by(name) %>%
   summarise(n = n(),
+            cpers_length = median(sl_mm[value == 'cpers']),
+            chya_length = median(sl_mm[value == 'chya']),
             n_cpers = sum(value == 'cpers'),
             n_chya = sum(value == 'chya'),
-            tidy(t.test(sl_mm ~ value)))
+            tidy(kruskal.test(sl_mm ~ value)))
 
 
-
-disagreement_anova <- full_cope_data %>%
-  select(ID, sl_mm, contains('species'), structure_assignment_prob) %>%
-  mutate(reason = case_when(co1_species != microsat_species & co1_species != 'unknown' ~ 'Mitochondrial - Nuclear Disagreement',
-                            structure_assignment_prob < 0.9 ~ 'Low Assignment Probability',
-                            (morph_species != microsat_species | morph_species != co1_species & co1_species != 'unknown') & morph_species != 'unknown' ~ 'Morphological - Molecular Disagreement',
-                            TRUE ~ joint_species)) %>%
-  aov(sl_mm ~ reason, data = .)
-
-anova(disagreement_anova)
-effectsize(disagreement_anova)
-
-emmeans(disagreement_anova, ~reason) %>% contrast('pairwise')
-
-emmeans(disagreement_anova, ~reason) %>%
-  tidy %>%
-  ggplot(aes(x = reason, y = estimate, ymin = estimate - std.error, ymax = estimate + std.error)) +
-  geom_pointrange()
 
